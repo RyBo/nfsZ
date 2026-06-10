@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: nfsz/manager
-  newTag: e2e
+  newTag: dev

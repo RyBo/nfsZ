@@ -85,14 +85,20 @@ make kind-up        # builds an NFS-capable node image and creates the cluster
 make kind-prep      # docker-execs nfs-common into the running nodes
 ```
 
-Dev loop:
+Quickstart (from zero to verified cross-namespace sharing):
 
 ```sh
-make kind-up                                   # NFS-capable kind cluster
-make kind-load IMG=nfsz/manager:dev            # build + load manager and ganesha images
-make deploy IMG=nfsz/manager:dev
-kubectl -n nfsz-system set env deploy/nfsz-controller-manager GANESHA_IMAGE=nfsz/ganesha:dev
+make kind-up                          # NFS-capable kind cluster
+make dev-deploy IMG=nfsz/manager:dev  # build + load images, deploy operator
+make demo                             # SharedVolume across two namespaces + live write/read check
+make demo-clean                       # remove the example
+make kind-down                        # delete the cluster (detaches NFS mounts first)
 ```
+
+`make demo` applies [examples/quickstart.yaml](examples/quickstart.yaml): a
+1Gi SharedVolume targeting `demo-a` by name and `demo-b` by label, a writer
+pod appending timestamps in `demo-a`, and a reader tailing the same file
+from `demo-b`.
 
 Tests:
 

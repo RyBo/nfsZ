@@ -1,0 +1,66 @@
+# Quickstart: one SharedVolume consumed from two namespaces.
+#
+#   kubectl apply -f examples/quickstart.yaml
+#   kubectl get sv quickstart                  # wait for Ready 2/2
+#   kubectl -n demo-b logs reader -f           # shows lines written from demo-a
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-a
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-b
+  labels:
+    nfsz.dev/quickstart: "true"
+---
+apiVersion: nfsz.dev/v1alpha1
+kind: SharedVolume
+metadata:
+  name: quickstart
+spec:
+  capacity: 1Gi
+  namespaces:
+    names: [demo-a]                 # demo-a by name…
+    selector:                       # …demo-b via label selector
+      matchLabels:
+        nfsz.dev/quickstart: "true"
+---
+# Writes one timestamped line per second from demo-a.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: demo-a
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: writer
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo \"$(date) from demo-a\" >> /mnt/log || exit 1; sleep 1; done"]
+      volumeMounts:
+        - { name: shared, mountPath: /mnt }
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: quickstart
+---
+# Tails the same file from demo-b.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reader
+  namespace: demo-b
+spec:
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: reader
+      image: busybox:1.36
+      command: ["sh", "-c", "touch /mnt/log; tail -f /mnt/log"]
+      volumeMounts:
+        - { name: shared, mountPath: /mnt }
+  volumes:
+    - name: shared
+      persistentVolumeClaim:
+        claimName: quickstart

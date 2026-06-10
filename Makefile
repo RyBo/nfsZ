@@ -91,7 +91,14 @@ kind-up: kind-node-image ## Create the kind cluster (NFS-capable nodes).
 	esac
 
 .PHONY: kind-down
-kind-down: ## Delete the kind cluster.
+kind-down: ## Delete the kind cluster (detaching NFS mounts first to avoid wedged nodes).
+	-@kubectl --context kind-$(KIND_CLUSTER) delete sharedvolumes --all --timeout=90s 2>/dev/null || true
+	@# Force-abort and detach any remaining NFS mounts while servers are still
+	@# reachable; a hard NFS mount whose server is gone blocks in the kernel
+	@# and makes the node container unkillable (requires a VM restart on macOS).
+	-@for n in $$($(KIND) get nodes --name $(KIND_CLUSTER) 2>/dev/null); do \
+		docker exec $$n sh -c 'grep " nfs4 " /proc/mounts | cut -d" " -f2 | xargs -r -n1 umount -f -l' 2>/dev/null || true; \
+	done
 	$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: kind-prep
@@ -109,6 +116,29 @@ kind-load: ganesha-image docker-build ## Load manager + ganesha images into kind
 .PHONY: phase0
 phase0: ## Run the manual NFSv4-in-kind validation spike.
 	hack/phase0/phase0.sh
+
+.PHONY: dev-deploy
+dev-deploy: kind-load deploy ## Deploy the operator to kind using locally built images.
+	kubectl -n nfsz-system set env deploy/nfsz-controller-manager GANESHA_IMAGE=$(GANESHA_IMG)
+	kubectl -n nfsz-system rollout status deploy/nfsz-controller-manager --timeout=180s
+
+.PHONY: demo
+demo: ## Apply the quickstart example and verify cross-namespace sharing.
+	kubectl apply -f examples/quickstart.yaml
+	kubectl wait --for=jsonpath='{.status.phase}'=Ready sharedvolume/quickstart --timeout=180s
+	kubectl get sharedvolume quickstart
+	kubectl -n demo-a wait --for=condition=Ready pod/writer --timeout=180s
+	kubectl -n demo-b wait --for=condition=Ready pod/reader --timeout=180s
+	@echo "--- waiting 5s, then lines visible from demo-b (written in demo-a): ---"
+	@sleep 5
+	kubectl -n demo-b exec reader -- tail -5 /mnt/log
+
+.PHONY: demo-clean
+demo-clean: ## Remove the quickstart example.
+	-kubectl delete pod -n demo-a writer --grace-period=1 --ignore-not-found
+	-kubectl delete pod -n demo-b reader --grace-period=1 --ignore-not-found
+	-kubectl delete sharedvolume quickstart --ignore-not-found --timeout=120s
+	-kubectl delete ns demo-a demo-b --ignore-not-found --wait=false
 
 .PHONY: setup-test-e2e
 setup-test-e2e: kind-up ## Set up the Kind cluster for e2e tests if it does not exist
