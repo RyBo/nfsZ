@@ -1,6 +1,18 @@
-# nfsZ
+```text
+         __        _____
+  _ __  / _| ___  |__  /
+ | '_ \| |_ / __|   / /
+ | | | |  _|\__ \  / /_
+ |_| |_|_|  |___/ /____|
+```
 
 **Cross-namespace RWX volumes for Kubernetes — no external NFS server, ever.**
+
+> ⚠️ **Heads up: this project was completely vibe coded** for a few small
+> personal use-cases. It works great on my machine™, it has tests, and it
+> still owes you zero guarantees. Use at your own risk, expect sharp edges,
+> and please do **not** run it in production. If it eats your data, you get
+> to keep both halves.
 
 Kubernetes has no native way to share a live, multi-writer volume across
 namespaces: PVCs are namespaced and a PV binds exactly one PVC. The usual
