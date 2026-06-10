@@ -1,0 +1,9 @@
+apiVersion: nfsz.dev/v1alpha1
+kind: SharedVolume
+metadata:
+  labels:
+    app.kubernetes.io/name: nfsz
+    app.kubernetes.io/managed-by: kustomize
+  name: sharedvolume-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: nfsz
+description: A Helm chart to distribute the project nfsz
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: "https://example.com/icon.png"
