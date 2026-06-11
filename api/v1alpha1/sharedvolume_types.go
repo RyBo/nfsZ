@@ -33,6 +33,21 @@ const (
 	ReclaimRetain ReclaimPolicy = "Retain"
 )
 
+// NetworkPolicyMode controls whether the operator manages a NetworkPolicy
+// restricting access to this volume's NFS server.
+// +kubebuilder:validation:Enum=Enabled;Disabled
+type NetworkPolicyMode string
+
+const (
+	// NetworkPolicyEnabled creates a per-volume NetworkPolicy admitting only
+	// cluster nodes (kubelet performs the mounts) and pods in target
+	// namespaces. Enforcement requires a CNI that implements NetworkPolicy.
+	NetworkPolicyEnabled NetworkPolicyMode = "Enabled"
+	// NetworkPolicyDisabled leaves the NFS server reachable by any pod in
+	// the cluster.
+	NetworkPolicyDisabled NetworkPolicyMode = "Disabled"
+)
+
 // NamespaceSelection picks the namespaces that receive a PVC for this volume.
 // The effective set is the union of Names and namespaces matching Selector.
 type NamespaceSelection struct {
@@ -65,6 +80,12 @@ type SharedVolumeSpec struct {
 	// +kubebuilder:default=Delete
 	// +optional
 	ReclaimPolicy ReclaimPolicy `json:"reclaimPolicy,omitempty"`
+
+	// networkPolicy controls the per-volume NetworkPolicy that restricts
+	// NFS access to cluster nodes and target namespaces.
+	// +kubebuilder:default=Enabled
+	// +optional
+	NetworkPolicy NetworkPolicyMode `json:"networkPolicy,omitempty"`
 }
 
 // SharedVolumePhase is a coarse rollup of the volume's state.

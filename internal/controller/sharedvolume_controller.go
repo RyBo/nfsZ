@@ -25,6 +25,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,12 +61,18 @@ type SharedVolumeReconciler struct {
 	OperatorNamespace string
 	// GaneshaImage is the NFS server image to run.
 	GaneshaImage string
+	// AllowCIDRs are extra CIDRs admitted by generated NetworkPolicies, for
+	// CNIs whose cross-node traffic arrives from tunnel IPs rather than
+	// node IPs (e.g. Calico VXLAN).
+	AllowCIDRs []string
 }
 
 // +kubebuilder:rbac:groups=nfsz.dev,resources=sharedvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=nfsz.dev,resources=sharedvolumes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=nfsz.dev,resources=sharedvolumes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -110,6 +118,10 @@ func (r *SharedVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.cleanupStaleBindings(ctx, sv, targets); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	if err := r.reconcileNetworkPolicy(ctx, sv, targets); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.updateStatus(ctx, sv, clusterIP, serverReady, bindings); err != nil {
@@ -189,6 +201,63 @@ func (r *SharedVolumeReconciler) reconcileServer(ctx context.Context, sv *nfszv1
 	// The ClusterIP is stamped into immutable PV specs; the Service must
 	// never be recreated while PVs exist. We only ever read it here.
 	return existingSvc.Spec.ClusterIP, serverReady, nil
+}
+
+// nodeIPs returns the sorted addresses of all cluster nodes. Kubelet mounts
+// NFS from the node network namespace, so generated NetworkPolicies must
+// admit these.
+func (r *SharedVolumeReconciler) nodeIPs(ctx context.Context) ([]string, error) {
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return nil, err
+	}
+	set := map[string]bool{}
+	for i := range nodeList.Items {
+		for _, addr := range nodeList.Items[i].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP || addr.Type == corev1.NodeExternalIP {
+				set[addr.Address] = true
+			}
+		}
+	}
+	ips := make([]string, 0, len(set))
+	for ip := range set {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	return ips, nil
+}
+
+// reconcileNetworkPolicy keeps the per-volume ingress policy in sync with
+// the target namespaces and current node IPs, or removes it when disabled.
+func (r *SharedVolumeReconciler) reconcileNetworkPolicy(ctx context.Context, sv *nfszv1alpha1.SharedVolume, targets []string) error {
+	existing := &networkingv1.NetworkPolicy{}
+	key := types.NamespacedName{Namespace: r.OperatorNamespace, Name: ServerName(sv)}
+	getErr := r.Get(ctx, key, existing)
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return getErr
+	}
+
+	if sv.Spec.NetworkPolicy == nfszv1alpha1.NetworkPolicyDisabled {
+		if getErr == nil {
+			return client.IgnoreNotFound(r.Delete(ctx, existing))
+		}
+		return nil
+	}
+
+	ips, err := r.nodeIPs(ctx)
+	if err != nil {
+		return err
+	}
+	desired := BuildNetworkPolicy(sv, r.OperatorNamespace, targets, ips, r.AllowCIDRs)
+
+	if apierrors.IsNotFound(getErr) {
+		return r.createOwned(ctx, sv, desired)
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		existing.Spec = desired.Spec
+		return r.Update(ctx, existing)
+	}
+	return nil
 }
 
 // targetNamespaces resolves spec.namespaces to the sorted set of existing,
@@ -390,6 +459,7 @@ func (r *SharedVolumeReconciler) reconcileDelete(ctx context.Context, sv *nfszv1
 
 	// 2. Server stack.
 	for _, obj := range []client.Object{
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName(sv), Namespace: r.OperatorNamespace}},
@@ -540,13 +610,28 @@ func (r *SharedVolumeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return reqs
 	}
 
+	// Node add/remove must refresh every volume's NetworkPolicy ipBlocks.
+	mapNode := func(ctx context.Context, _ client.Object) []reconcile.Request {
+		svList := &nfszv1alpha1.SharedVolumeList{}
+		if err := mgr.GetClient().List(ctx, svList); err != nil {
+			return nil
+		}
+		reqs := make([]reconcile.Request, 0, len(svList.Items))
+		for i := range svList.Items {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Name: svList.Items[i].Name}})
+		}
+		return reqs
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&nfszv1alpha1.SharedVolume{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.PersistentVolume{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(mapNamespace)).
+		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(mapNode)).
 		Named("sharedvolume").
 		Complete(r)
 }

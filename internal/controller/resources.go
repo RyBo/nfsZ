@@ -20,9 +20,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -271,4 +273,66 @@ func BuildConsumerPVC(sv *nfszv1alpha1.SharedVolume, namespace string) *corev1.P
 
 func ServerEndpoint(clusterIP string) string {
 	return fmt.Sprintf("%s:%d", clusterIP, nfsPort)
+}
+
+// BuildNetworkPolicy restricts ingress to this volume's NFS server pod.
+//
+// Threat model nuance: legitimate NFS traffic originates from *nodes*, not
+// consumer pods — kubelet performs the mount in the node's network
+// namespace. The rogue path being closed is a pod speaking NFS directly
+// (userspace client over TCP, no mount privileges needed). So the policy
+// admits: cluster node IPs (nodeIPs, auto-discovered), pods in target
+// namespaces (matched via the kubernetes.io/metadata.name label), and any
+// operator-configured extra CIDRs (for CNIs that SNAT cross-node traffic to
+// tunnel IPs, e.g. Calico VXLAN). Everything else is denied.
+//
+// Enforcement requires a CNI that implements NetworkPolicy; kind's default
+// kindnet does not.
+func BuildNetworkPolicy(sv *nfszv1alpha1.SharedVolume, operatorNamespace string, targets, nodeIPs, extraCIDRs []string) *networkingv1.NetworkPolicy {
+	nfsTCP := intstr.FromInt32(nfsPort)
+	tcp := corev1.ProtocolTCP
+
+	var peers []networkingv1.NetworkPolicyPeer
+	for _, ns := range targets {
+		peers = append(peers, networkingv1.NetworkPolicyPeer{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{corev1.LabelMetadataName: ns},
+			},
+		})
+	}
+	for _, ip := range nodeIPs {
+		cidr := ip + "/32"
+		if strings.Contains(ip, ":") {
+			cidr = ip + "/128"
+		}
+		peers = append(peers, networkingv1.NetworkPolicyPeer{
+			IPBlock: &networkingv1.IPBlock{CIDR: cidr},
+		})
+	}
+	for _, cidr := range extraCIDRs {
+		peers = append(peers, networkingv1.NetworkPolicyPeer{
+			IPBlock: &networkingv1.IPBlock{CIDR: cidr},
+		})
+	}
+
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ServerName(sv),
+			Namespace: operatorNamespace,
+			Labels:    managedLabels(sv),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					LabelSharedVolume:             sv.Name,
+					"app.kubernetes.io/component": "nfs-server",
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{{
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &nfsTCP}},
+				From:  peers,
+			}},
+		},
+	}
 }

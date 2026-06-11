@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -59,6 +60,16 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func splitNonEmpty(csv string) []string {
+	var out []string
+	for _, s := range strings.Split(csv, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -77,6 +88,11 @@ func main() {
 	flag.StringVar(&ganeshaImage, "ganesha-image",
 		envOr("GANESHA_IMAGE", "ghcr.io/rybo/nfsz-ganesha:latest"),
 		"NFS-Ganesha server image used for SharedVolume servers.")
+	var allowCIDRs string
+	flag.StringVar(&allowCIDRs, "allow-cidrs", envOr("ALLOW_CIDRS", ""),
+		"Comma-separated extra CIDRs admitted by generated NetworkPolicies, "+
+			"for CNIs whose cross-node traffic arrives from tunnel IPs "+
+			"(e.g. Calico VXLAN).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -199,6 +215,7 @@ func main() {
 		Recorder:          mgr.GetEventRecorderFor("nfsz"),
 		OperatorNamespace: operatorNamespace,
 		GaneshaImage:      ganeshaImage,
+		AllowCIDRs:        splitNonEmpty(allowCIDRs),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "sharedvolume")
 		os.Exit(1)

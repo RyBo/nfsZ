@@ -134,6 +134,15 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                 type: object
+              networkPolicy:
+                default: Enabled
+                description: |-
+                  networkPolicy controls the per-volume NetworkPolicy that restricts
+                  NFS access to cluster nodes and target namespaces.
+                enum:
+                - Enabled
+                - Disabled
+                type: string
               reclaimPolicy:
                 default: Delete
                 description: reclaimPolicy controls the fate of the backing PVC on
@@ -341,6 +350,7 @@ rules:
   - ""
   resources:
   - namespaces
+  - nodes
   verbs:
   - get
   - list
@@ -349,6 +359,18 @@ rules:
   - apps
   resources:
   - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
   verbs:
   - create
   - delete

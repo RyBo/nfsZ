@@ -82,7 +82,13 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
+	// Drain CRs before the operator goes away — finalizers can't run once
+	// the controller is deleted, and CRD deletion then hangs forever.
+	By("deleting any remaining SharedVolumes")
+	cmd := exec.Command("kubectl", "delete", "sharedvolumes", "--all", "--timeout=120s")
+	_, _ = utils.Run(cmd)
+
 	By("undeploying the operator")
-	cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
+	cmd = exec.Command("make", "undeploy", "ignore-not-found=true")
 	_, _ = utils.Run(cmd)
 })

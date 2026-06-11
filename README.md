@@ -86,8 +86,9 @@ shared-data   Ready   10Gi       10.96.218.219:2049   2/2     31s
   (heavy byte-range locking over NFS is a corruption story waiting to be
   told).
 - **Multi-tenant clusters with untrusted workloads** — see the
-  [security model](#security-model); the namespace boundary is *not* an
-  access boundary today.
+  [security model](#security-model); the per-volume NetworkPolicy helps
+  only where the CNI enforces it, and AUTH_SYS remains spoofable inside
+  target namespaces.
 - **Anything that needs enforced quotas** — capacity is advisory (see
   [sharp edges](#operational-concerns--known-sharp-edges)).
 - **IOPS- or latency-sensitive workloads** — userspace NFS over a Service
@@ -162,20 +163,45 @@ managed/distro Kubernetes node has both; immutable minimal OSes (e.g.
 Talos) need it configured. Read the next two sections before installing
 anywhere that matters.
 
+> ⚠️ **Uninstall order matters.** Delete all SharedVolumes and let them
+> finish finalizing **before** removing the operator
+> (`kubectl delete -f dist/install.yaml` / `helm uninstall`). Removing the
+> controller first strands CRs whose finalizers can no longer run — CRD
+> deletion then hangs forever, and NFS servers die under live mounts (see
+> the wedge warning below). `make undeploy` drains SharedVolumes for you.
+
 ## Security model
 
-> ⚠️ **MAJOR CONCERN — target namespaces are a *provisioning* boundary, not
-> an *access* boundary.** The NFS Service is a plain ClusterIP serving
-> `sec=sys` (AUTH_SYS — the *client asserts its own UID*) with
-> `No_Root_Squash`. **Any pod in the cluster** can talk to
-> `<clusterIP>:2049` and read/write every share **as any UID, including
-> root**. It doesn't even need mount privileges: a userspace NFS client
-> library (e.g. libnfs) speaks the protocol over plain TCP from an
-> unprivileged container. Until per-volume NetworkPolicies land (top
-> roadmap item), only run nfsZ where **every workload in the cluster is
-> trusted**.
+NFS with `sec=sys` (AUTH_SYS) means the *client asserts its own UID*, and
+nfsZ exports with `No_Root_Squash` — so reachability equals full
+root-equivalent access to a share. A pod doesn't even need mount privileges
+to speak NFS: a userspace client library (e.g. libnfs) talks plain TCP from
+an unprivileged container. nfsZ's defense is network-level:
 
-What you do get today:
+**Per-volume NetworkPolicy (default: enabled).** Each SharedVolume gets a
+NetworkPolicy on its server pod admitting TCP 2049 only from:
+
+- **cluster nodes** (auto-discovered, refreshed as nodes join/leave) —
+  kubelet performs the real mounts from the node's network namespace, so
+  node IPs are the legitimate traffic source;
+- **pods in target namespaces** — matched via the
+  `kubernetes.io/metadata.name` label;
+- any extra CIDRs passed via `--allow-cidrs` (see caveats).
+
+Everything else — i.e. a rogue pod in a non-target namespace — is denied.
+Opt out per volume with `spec.networkPolicy: Disabled`.
+
+> ⚠️ **NetworkPolicy is only as real as your CNI.** Policies are enforced
+> by the CNI plugin; **kind's default CNI (kindnet) does not enforce them
+> at all**, and on any cluster without a policy-capable CNI (Calico,
+> Cilium, etc.) the policy object exists but does nothing. Also note the
+> node-IP allowance means hostNetwork pods are admitted, and CNIs that SNAT
+> cross-node traffic to tunnel IPs (e.g. Calico in VXLAN mode) need those
+> tunnel ranges passed via `--allow-cidrs`, which widens the allowance to
+> that CIDR. Treat the policy as a strong lock on a door whose frame is
+> your CNI.
+
+What you get beyond the policy:
 
 - **Admin-gated creation**: SharedVolume is cluster-scoped, so only cluster
   admins decide what is shared and where it appears.
@@ -267,12 +293,13 @@ Shipped in v1:
 - [x] One-command install (`dist/install.yaml`) + Helm chart (`dist/chart`)
 - [x] NFS-capable KinD tooling, envtest + e2e suites, quickstart demo
 - [x] Wedge-proof `make kind-down` (force-detaches NFS mounts pre-delete)
+- [x] **Per-volume NetworkPolicy** (default on; `spec.networkPolicy` to opt
+      out) admitting only cluster nodes + target namespaces on 2049 —
+      closes the cluster-wide access hole *where the CNI enforces policy*;
+      `--allow-cidrs` for tunnel-SNAT CNIs
 
 Planned — security first:
 
-- [ ] **Per-volume NetworkPolicy** restricting port 2049 to target
-      namespaces — *top priority; closes the cluster-wide access hole on
-      CNIs that enforce policy*
 - [ ] Export options: squash/anon-uid, per-namespace read-only
 - [ ] Namespace opt-in/grant model (consuming namespaces must consent)
 - [ ] Quota enforcement (XFS project quotas on the backing filesystem)

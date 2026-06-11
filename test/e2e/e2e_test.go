@@ -113,6 +113,20 @@ spec:
 		}, 2*time.Minute, 2*time.Second).Should(Equal("Ready 2/2"))
 	})
 
+	It("creates a NetworkPolicy admitting only nodes and target namespaces", func() {
+		// kind's default CNI (kindnet) does not enforce NetworkPolicies, so
+		// this asserts shape, not enforcement.
+		out := mustKubectl("get", "networkpolicy", "-n", operatorNamespace, "nfsz-"+sv+"-server",
+			"-o", "jsonpath={.spec.ingress[0].ports[0].port} {.spec.ingress[0].from[*].namespaceSelector.matchLabels['kubernetes\\.io/metadata\\.name']}")
+		Expect(out).To(ContainSubstring("2049"))
+		Expect(out).To(ContainSubstring("e2e-a"))
+		Expect(out).To(ContainSubstring("e2e-b"))
+
+		ipBlocks := mustKubectl("get", "networkpolicy", "-n", operatorNamespace, "nfsz-"+sv+"-server",
+			"-o", "jsonpath={.spec.ingress[0].from[*].ipBlock.cidr}")
+		Expect(strings.TrimSpace(ipBlocks)).NotTo(BeEmpty(), "node IPs should be admitted for kubelet mounts")
+	})
+
 	It("shares live writes across namespaces", func() {
 		applyStdin(mountPod("writer", "e2e-a", sv, "while true; do date >> /mnt/log || exit 1; sleep 1; done"))
 		applyStdin(mountPod("reader", "e2e-b", sv, "touch /mnt/log; tail -f /mnt/log"))

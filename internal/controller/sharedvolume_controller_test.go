@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,6 +50,7 @@ func newReconciler() *SharedVolumeReconciler {
 		Recorder:          record.NewFakeRecorder(64),
 		OperatorNamespace: operatorNS,
 		GaneshaImage:      "nfsz/ganesha:test",
+		AllowCIDRs:        []string{"10.99.0.0/16"},
 	}
 }
 
@@ -219,6 +221,50 @@ var _ = Describe("SharedVolume controller", func() {
 		reconcileOnce(sv.Name)
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: PVName(sv, "repair-ns")}, pv)).To(Succeed())
 		Expect(string(pv.Spec.ClaimRef.UID)).To(BeEmpty())
+	})
+
+	It("manages the per-volume NetworkPolicy", func() {
+		ensureNamespace("np-ns", nil)
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "np-node"}}
+		if err := k8sClient.Create(ctx, node); err != nil {
+			Expect(apierrors.IsAlreadyExists(err)).To(BeTrue())
+		}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "np-node"}, node)).To(Succeed())
+		node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.9"}}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+		sv := newSharedVolume([]string{"np-ns"}, nil)
+		Expect(k8sClient.Create(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		reconcileOnce(sv.Name)
+
+		By("policy admits target namespaces and node IPs on 2049 only")
+		np := &networkingv1.NetworkPolicy{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, np)).To(Succeed())
+		Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(LabelSharedVolume, sv.Name))
+		Expect(np.Spec.Ingress).To(HaveLen(1))
+		Expect(np.Spec.Ingress[0].Ports[0].Port.IntValue()).To(Equal(2049))
+
+		var nsPeers, ipPeers []string
+		for _, p := range np.Spec.Ingress[0].From {
+			if p.NamespaceSelector != nil {
+				nsPeers = append(nsPeers, p.NamespaceSelector.MatchLabels[corev1.LabelMetadataName])
+			}
+			if p.IPBlock != nil {
+				ipPeers = append(ipPeers, p.IPBlock.CIDR)
+			}
+		}
+		Expect(nsPeers).To(ContainElement("np-ns"))
+		Expect(ipPeers).To(ContainElement("172.18.0.9/32"))
+		Expect(ipPeers).To(ContainElement("10.99.0.0/16"), "operator AllowCIDRs included")
+
+		By("disabling removes the policy")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, sv)).To(Succeed())
+		sv.Spec.NetworkPolicy = nfszv1alpha1.NetworkPolicyDisabled
+		Expect(k8sClient.Update(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, np)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
 	It("tears down in order and honors reclaimPolicy Retain", func() {
