@@ -60,6 +60,54 @@ spec:
           spec:
             description: spec defines the desired state of SharedVolume
             properties:
+              backup:
+                description: |-
+                  backup configures a scheduled mirror of this volume's data to a
+                  destination that survives the cluster, plus auto-seeding of fresh
+                  volumes from that mirror.
+                properties:
+                  destination:
+                    description: destination is where backups are written.
+                    properties:
+                      hostPath:
+                        description: hostPath writes backups to a node-local directory.
+                        properties:
+                          path:
+                            description: |-
+                              path is an absolute directory on the node. Data is mirrored to
+                              <path>/<sharedvolume-name>/.
+                            pattern: ^/
+                            type: string
+                        required:
+                        - path
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: destination requires hostPath
+                      rule: has(self.hostPath)
+                  restorePolicy:
+                    default: Auto
+                    description: |-
+                      restorePolicy controls auto-seeding of fresh volumes from an existing
+                      backup at the destination.
+                    enum:
+                    - Auto
+                    - Never
+                    type: string
+                  schedule:
+                    description: |-
+                      schedule is a standard cron expression, evaluated by the CronJob
+                      controller in the cluster's time zone.
+                    minLength: 1
+                    type: string
+                  suspend:
+                    description: suspend pauses scheduled backups without deleting
+                      the CronJob.
+                    type: boolean
+                required:
+                - destination
+                - schedule
+                type: object
               capacity:
                 anyOf:
                 - type: integer
@@ -241,6 +289,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastBackupTime:
+                description: |-
+                  lastBackupTime is the last time a scheduled backup completed
+                  successfully, copied from the backup CronJob's status.
+                format: date-time
+                type: string
               observedGeneration:
                 format: int64
                 type: integer

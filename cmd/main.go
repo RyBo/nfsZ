@@ -88,6 +88,10 @@ func main() {
 	flag.StringVar(&ganeshaImage, "ganesha-image",
 		envOr("GANESHA_IMAGE", "ghcr.io/rybo/nfsz-ganesha:latest"),
 		"NFS-Ganesha server image used for SharedVolume servers.")
+	var backupImage string
+	flag.StringVar(&backupImage, "backup-image",
+		envOr("BACKUP_IMAGE", "ghcr.io/rybo/nfsz-backup:latest"),
+		"rsync image used for SharedVolume backup and seed jobs.")
 	var allowCIDRs string
 	flag.StringVar(&allowCIDRs, "allow-cidrs", envOr("ALLOW_CIDRS", ""),
 		"Comma-separated extra CIDRs admitted by generated NetworkPolicies, "+
@@ -215,6 +219,7 @@ func main() {
 		Recorder:          mgr.GetEventRecorder("nfsz"),
 		OperatorNamespace: operatorNamespace,
 		GaneshaImage:      ganeshaImage,
+		BackupImage:       backupImage,
 		AllowCIDRs:        splitNonEmpty(allowCIDRs),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "sharedvolume")

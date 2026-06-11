@@ -145,6 +145,60 @@ make test-e2e       # full lifecycle against kind (cross-ns I/O, server-kill rec
 make phase0         # standalone NFSv4-in-kind validation spike (no operator)
 ```
 
+## Backup & restore
+
+Without backups, a SharedVolume's data lives inside the kind node container
+and dies with `kind delete cluster`. `spec.backup` fixes that: a per-volume
+CronJob rsyncs the data to a directory that exists on every node, and on
+kind that directory is a **host mount** — `make kind-up` maps
+`$NFSZ_BACKUP_HOST_DIR` (default `~/.nfsz/backups`) into every node at
+`/var/nfsz-backups`, so the mirror survives anything that happens to the
+cluster:
+
+```yaml
+spec:
+  backup:
+    schedule: "0 */6 * * *"
+    destination:
+      hostPath:
+        path: /var/nfsz-backups   # the *node* path; kind maps it to the host dir
+```
+
+See [examples/backup.yaml](examples/backup.yaml). The mirror at
+`~/.nfsz/backups/<volume>/` is a **plain browsable file tree** — media files
+are directly playable from the host, no restore tooling needed. Run a backup
+immediately with
+`kubectl -n nfsz-system create job --from=cronjob/nfsz-<volume>-backup backup-now`;
+`status.lastBackupTime` tracks the last success.
+
+**Restore is automatic.** When a SharedVolume with `spec.backup` is created
+and a mirror for it already exists at the destination, a one-shot seed job
+copies it into the fresh volume *before* the NFS server first starts (the
+`Restored` condition reports progress). Disaster recovery is therefore:
+
+```sh
+make kind-up && make dev-deploy IMG=nfsz/manager:dev
+kubectl apply -f <your SharedVolume manifests>   # data comes back by itself
+```
+
+The seed never overwrites anything: it runs only before the server's first
+start, and refuses to touch a volume that already contains data. Opt out
+with `restorePolicy: Never`.
+
+Caveats, deliberately accepted for simplicity:
+
+- **It's a mirror, not versioned backup.** `rsync --delete` propagates
+  deletions on the next run — an accidental `rm` in the cluster reaches the
+  mirror at the next schedule tick. Point Time Machine (or anything) at the
+  host dir if you want history.
+- **Per-file consistency only.** A backup during heavy writes can capture a
+  torn view across files. Fine for media libraries; wrong for databases.
+- **Backup pods use hostPath and run as root** (rsync must read every UID's
+  files). Namespaces enforcing `baseline`/`restricted` Pod Security
+  Admission will reject them; `nfsz-system` ships without PSA labels.
+- Clusters created before this feature lack the node mount — `make
+  kind-down kind-up` to pick it up.
+
 ## Install on a real cluster
 
 ```sh
@@ -245,10 +299,10 @@ The rest, roughly by likelihood of biting you:
   A *node* failure stalls I/O until the RWO backing PVC force-detaches and
   the pod reschedules, which on many storage backends takes minutes.
 - **Durability = your backing StorageClass.** nfsZ adds no replication. On
-  local-path in a home lab, the data lives on one disk of one node. There
-  is no snapshot or backup integration, and backup tools like Velero will
-  be confused by the pre-bound PVs — back up the *backing PVC's* contents
-  externally.
+  local-path in a home lab, the data lives on one disk of one node. Use
+  `spec.backup` (see [Backup & restore](#backup--restore)) to mirror the
+  data off-cluster; Velero remains confused by the pre-bound PVs, so don't
+  rely on it.
 - **kube-proxy assumption.** Mounts originate in the node's network
   namespace, so ClusterIPs must be reachable from there. Standard
   kube-proxy (iptables/IPVS): yes. Cilium with kube-proxy replacement:
@@ -297,6 +351,10 @@ Shipped in v1:
       out) admitting only cluster nodes + target namespaces on 2049 —
       closes the cluster-wide access hole *where the CNI enforces policy*;
       `--allow-cidrs` for tunnel-SNAT CNIs
+- [x] **Scheduled backups + auto-restore** (`spec.backup`) — per-volume
+      rsync mirror to a host-mounted directory that survives cluster
+      deletion; fresh volumes auto-seed from an existing mirror before the
+      server first starts
 
 Planned — security first:
 
@@ -308,7 +366,7 @@ Planned — security first:
 - [ ] HA / failover story for the server
 - [ ] DNS-based endpoints for clusters where node-level DNS works
 - [ ] CSI backend option (`--pv-backend=csi` via csi-driver-nfs)
-- [ ] Snapshot/backup integration + Velero guidance
+- [ ] More backup destinations (S3-compatible) + versioned engines (restic)
 - [ ] Kerberos (`sec=krb5p`) — real authn + encryption; aspirational
 
 ## License

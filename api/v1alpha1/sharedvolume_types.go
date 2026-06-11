@@ -48,6 +48,64 @@ const (
 	NetworkPolicyDisabled NetworkPolicyMode = "Disabled"
 )
 
+// RestorePolicy controls whether a brand-new (empty) volume is seeded from an
+// existing backup at the destination before the NFS server starts serving.
+// +kubebuilder:validation:Enum=Auto;Never
+type RestorePolicy string
+
+const (
+	// RestoreAuto seeds a fresh volume from the backup destination when a
+	// backup for this volume exists there and the volume's data is empty.
+	RestoreAuto RestorePolicy = "Auto"
+	// RestoreNever disables seeding; new volumes always start empty.
+	RestoreNever RestorePolicy = "Never"
+)
+
+// HostPathDestination mirrors backups into a directory that exists on every
+// node, e.g. a kind extraMount shared from the host machine.
+type HostPathDestination struct {
+	// path is an absolute directory on the node. Data is mirrored to
+	// <path>/<sharedvolume-name>/.
+	// +kubebuilder:validation:Pattern=`^/`
+	// +required
+	Path string `json:"path"`
+}
+
+// BackupDestination selects where backups are written. Exactly one member
+// must be set; the struct exists so other destinations (e.g. object storage)
+// can be added without API churn.
+// +kubebuilder:validation:XValidation:rule="has(self.hostPath)",message="destination requires hostPath"
+type BackupDestination struct {
+	// hostPath writes backups to a node-local directory.
+	// +optional
+	HostPath *HostPathDestination `json:"hostPath,omitempty"`
+}
+
+// BackupSpec configures a scheduled rsync mirror of this volume's data. The
+// mirror is a plain browsable file tree; deletions in the volume propagate to
+// the mirror on the next run.
+type BackupSpec struct {
+	// schedule is a standard cron expression, evaluated by the CronJob
+	// controller in the cluster's time zone.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Schedule string `json:"schedule"`
+
+	// destination is where backups are written.
+	// +required
+	Destination BackupDestination `json:"destination"`
+
+	// suspend pauses scheduled backups without deleting the CronJob.
+	// +optional
+	Suspend *bool `json:"suspend,omitempty"`
+
+	// restorePolicy controls auto-seeding of fresh volumes from an existing
+	// backup at the destination.
+	// +kubebuilder:default=Auto
+	// +optional
+	RestorePolicy RestorePolicy `json:"restorePolicy,omitempty"`
+}
+
 // NamespaceSelection picks the namespaces that receive a PVC for this volume.
 // The effective set is the union of Names and namespaces matching Selector.
 type NamespaceSelection struct {
@@ -86,6 +144,12 @@ type SharedVolumeSpec struct {
 	// +kubebuilder:default=Enabled
 	// +optional
 	NetworkPolicy NetworkPolicyMode `json:"networkPolicy,omitempty"`
+
+	// backup configures a scheduled mirror of this volume's data to a
+	// destination that survives the cluster, plus auto-seeding of fresh
+	// volumes from that mirror.
+	// +optional
+	Backup *BackupSpec `json:"backup,omitempty"`
 }
 
 // SharedVolumePhase is a coarse rollup of the volume's state.
@@ -120,6 +184,17 @@ type NamespaceBinding struct {
 const (
 	ConditionServerReady = "ServerReady"
 	ConditionAllBound    = "AllBound"
+	// ConditionRestored reports the outcome of the one-shot seed-from-backup
+	// step that runs before the NFS server first starts.
+	ConditionRestored = "Restored"
+)
+
+// Reasons used with ConditionRestored.
+const (
+	ReasonSeedRunning       = "SeedRunning"
+	ReasonSeeded            = "Seeded"
+	ReasonSeedFailed        = "SeedFailed"
+	ReasonPreexistingServer = "PreexistingServer"
 )
 
 // SharedVolumeStatus defines the observed state of SharedVolume.
@@ -142,6 +217,11 @@ type SharedVolumeStatus struct {
 	// bindings lists per-namespace PVC states.
 	// +optional
 	Bindings []NamespaceBinding `json:"bindings,omitempty"`
+
+	// lastBackupTime is the last time a scheduled backup completed
+	// successfully, copied from the backup CronJob's status.
+	// +optional
+	LastBackupTime *metav1.Time `json:"lastBackupTime,omitempty"`
 
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

@@ -36,6 +36,8 @@ var (
 	managerImage = "nfsz/manager:e2e"
 	// ganeshaImage is the NFS server image SharedVolume servers run.
 	ganeshaImage = "nfsz/ganesha:dev"
+	// backupImage runs backup/seed rsync jobs.
+	backupImage = "nfsz/backup:dev"
 )
 
 // TestE2E validates nfsZ against a real kind cluster with NFS-capable nodes
@@ -50,6 +52,9 @@ var _ = BeforeSuite(func() {
 	if img := os.Getenv("GANESHA_IMG"); img != "" {
 		ganeshaImage = img
 	}
+	if img := os.Getenv("BACKUP_IMG"); img != "" {
+		backupImage = img
+	}
 
 	By("building the manager image")
 	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
@@ -61,9 +66,15 @@ var _ = BeforeSuite(func() {
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to build the ganesha image")
 
+	By("building the backup image")
+	cmd = exec.Command("make", "backup-image", fmt.Sprintf("BACKUP_IMG=%s", backupImage))
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to build the backup image")
+
 	By("loading images into Kind")
 	Expect(utils.LoadImageToKindClusterWithName(managerImage)).To(Succeed())
 	Expect(utils.LoadImageToKindClusterWithName(ganeshaImage)).To(Succeed())
+	Expect(utils.LoadImageToKindClusterWithName(backupImage)).To(Succeed())
 
 	By("deploying the operator")
 	cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
@@ -71,7 +82,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred(), "Failed to deploy the operator")
 
 	cmd = exec.Command("kubectl", "-n", operatorNamespace, "set", "env",
-		"deploy/nfsz-controller-manager", "GANESHA_IMAGE="+ganeshaImage)
+		"deploy/nfsz-controller-manager", "GANESHA_IMAGE="+ganeshaImage, "BACKUP_IMAGE="+backupImage)
 	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred())
 

@@ -1,0 +1,24 @@
+# Template for the kind cluster config. `make kind-up` renders it to
+# bin/kind-config.yaml, substituting @NFSZ_BACKUP_HOST_DIR@ with the host
+# directory that backs SharedVolume backups (NFSZ_BACKUP_HOST_DIR, default
+# ~/.nfsz/backups). Every node mounts that directory at /var/nfsz-backups so
+# backup pods can reach it via hostPath regardless of scheduling, and the
+# data survives `kind delete cluster`.
+#
+# On macOS the host path must be shared with Docker Desktop ($HOME is by
+# default); the mount crosses into the Linux VM via virtiofs, which is fine
+# for rsync's plain file I/O (but would not be safe to export over NFS).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: nfsz
+nodes:
+  - role: control-plane
+    image: nfsz/kind-node:v1.36.1
+    extraMounts:
+      - hostPath: "@NFSZ_BACKUP_HOST_DIR@"
+        containerPath: /var/nfsz-backups
+  - role: worker
+    image: nfsz/kind-node:v1.36.1
+    extraMounts:
+      - hostPath: "@NFSZ_BACKUP_HOST_DIR@"
+        containerPath: /var/nfsz-backups

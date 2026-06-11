@@ -74,6 +74,8 @@ spec:
                 fieldPath: metadata.namespace
           - name: GANESHA_IMAGE
             value: ghcr.io/rybo/nfsz-ganesha:latest
+          - name: BACKUP_IMAGE
+            value: ghcr.io/rybo/nfsz-backup:latest
         ports:
         - containerPort: 8081
           name: health

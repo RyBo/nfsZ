@@ -72,6 +72,12 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 KIND_CLUSTER ?= nfsz
 KIND_NODE_IMG ?= nfsz/kind-node:v1.36.1
 GANESHA_IMG ?= nfsz/ganesha:dev
+BACKUP_IMG ?= nfsz/backup:dev
+# Host directory mounted into every kind node at /var/nfsz-backups; backup
+# mirrors land here and survive cluster deletion. On macOS it must be shared
+# with Docker Desktop ($HOME is by default). Changing it requires recreating
+# the cluster (make kind-down kind-up).
+NFSZ_BACKUP_HOST_DIR ?= $(HOME)/.nfsz/backups
 
 .PHONY: kind-node-image
 kind-node-image: ## Build the kindest/node image with nfs-common baked in.
@@ -81,13 +87,21 @@ kind-node-image: ## Build the kindest/node image with nfs-common baked in.
 ganesha-image: ## Build the NFS-Ganesha server image.
 	docker build -t $(GANESHA_IMG) images/ganesha
 
+.PHONY: backup-image
+backup-image: ## Build the rsync backup/seed image.
+	docker build -t $(BACKUP_IMG) images/backup
+
 .PHONY: kind-up
-kind-up: kind-node-image ## Create the kind cluster (NFS-capable nodes).
+kind-up: kind-node-image ## Create the kind cluster (NFS-capable nodes, backup host mount).
 	@case "$$($(KIND) get clusters)" in \
 		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation."; \
+			echo "NOTE: clusters created before the backup feature lack the"; \
+			echo "      /var/nfsz-backups host mount; run 'make kind-down kind-up' to add it." ;; \
 		*) \
-			$(KIND) create cluster --config hack/kind/kind-config.yaml --wait 120s ;; \
+			mkdir -p "$(NFSZ_BACKUP_HOST_DIR)" bin; \
+			sed 's|@NFSZ_BACKUP_HOST_DIR@|$(NFSZ_BACKUP_HOST_DIR)|' hack/kind/kind-config.yaml.in > bin/kind-config.yaml; \
+			$(KIND) create cluster --config bin/kind-config.yaml --wait 120s ;; \
 	esac
 
 .PHONY: kind-down
@@ -109,8 +123,9 @@ kind-prep: ## Install nfs-common into an existing (stock-image) kind cluster's n
 	done
 
 .PHONY: kind-load
-kind-load: ganesha-image docker-build ## Load manager + ganesha images into kind.
+kind-load: ganesha-image backup-image docker-build ## Load manager + ganesha + backup images into kind.
 	$(KIND) load docker-image $(GANESHA_IMG) --name $(KIND_CLUSTER)
+	$(KIND) load docker-image $(BACKUP_IMG) --name $(KIND_CLUSTER)
 	$(KIND) load docker-image $(IMG) --name $(KIND_CLUSTER)
 
 .PHONY: phase0
@@ -119,7 +134,7 @@ phase0: ## Run the manual NFSv4-in-kind validation spike.
 
 .PHONY: dev-deploy
 dev-deploy: kind-load deploy ## Deploy the operator to kind using locally built images.
-	kubectl -n nfsz-system set env deploy/nfsz-controller-manager GANESHA_IMAGE=$(GANESHA_IMG)
+	kubectl -n nfsz-system set env deploy/nfsz-controller-manager GANESHA_IMAGE=$(GANESHA_IMG) BACKUP_IMAGE=$(BACKUP_IMG)
 	kubectl -n nfsz-system rollout status deploy/nfsz-controller-manager --timeout=180s
 
 .PHONY: demo
@@ -149,7 +164,7 @@ setup-test-e2e: kind-up ## Set up the Kind cluster for e2e tests if it does not 
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests against the NFS-capable Kind cluster.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) GANESHA_IMG=$(GANESHA_IMG) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 30m
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) GANESHA_IMG=$(GANESHA_IMG) BACKUP_IMG=$(BACKUP_IMG) NFSZ_BACKUP_HOST_DIR=$(NFSZ_BACKUP_HOST_DIR) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 30m
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests

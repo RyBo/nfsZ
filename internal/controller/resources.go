@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -76,6 +77,14 @@ func PVName(sv *nfszv1alpha1.SharedVolume, namespace string) string {
 // ConsumerPVCName is what users reference in their pods: the SharedVolume name.
 func ConsumerPVCName(sv *nfszv1alpha1.SharedVolume) string {
 	return sv.Name
+}
+
+func BackupCronJobName(sv *nfszv1alpha1.SharedVolume) string {
+	return "nfsz-" + sv.Name + "-backup"
+}
+
+func SeedJobName(sv *nfszv1alpha1.SharedVolume) string {
+	return "nfsz-" + sv.Name + "-seed"
 }
 
 // BuildBackingPVC is the RWO volume that stores the data and backs the
@@ -332,6 +341,145 @@ func BuildNetworkPolicy(sv *nfszv1alpha1.SharedVolume, operatorNamespace string,
 				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &nfsTCP}},
 				From:  peers,
 			}},
+		},
+	}
+}
+
+// backupPodSpec is the shared shape of the backup and seed pods: the backing
+// PVC's data subPath at /data and the destination hostPath at /backup. Both
+// read other-UID files written over NFS, so they run as root (rsync needs
+// DAC override); namespaces enforcing baseline/restricted PSA will reject
+// them (hostPath + root).
+func backupPodSpec(sv *nfszv1alpha1.SharedVolume, image, script string, dataReadOnly bool) corev1.PodSpec {
+	hostDir := sv.Spec.Backup.Destination.HostPath.Path
+	return corev1.PodSpec{
+		RestartPolicy: corev1.RestartPolicyNever,
+		Containers: []corev1.Container{{
+			Name:    "rsync",
+			Image:   image,
+			Command: []string{"sh", "-c", script},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "backing", SubPath: "data", MountPath: "/data", ReadOnly: dataReadOnly},
+				{Name: "backup", MountPath: "/backup", ReadOnly: !dataReadOnly},
+			},
+		}},
+		Volumes: []corev1.Volume{
+			{
+				Name: "backing",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: BackingPVCName(sv),
+					},
+				},
+			},
+			{
+				Name: "backup",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{
+						Path: hostDir,
+						Type: ptr.To(corev1.HostPathDirectoryOrCreate),
+					},
+				},
+			},
+		},
+	}
+}
+
+// BuildBackupCronJob mirrors /export (the PVC's data subPath) to
+// <hostPath>/<name>/ on the volume's schedule. The mirror is plain files —
+// browsable and directly usable on the host — and deletions propagate
+// (--delete). -rlt rather than -a: chown/chmod fail on shared host mounts
+// (e.g. Docker Desktop virtiofs) and don't matter for a mirror.
+//
+// The pod mounts the RWO backing PVC directly instead of the NFS export, so
+// backups work even when the server is down; required podAffinity to the
+// server pod keeps it on the same node for RWO block storage (on local-path
+// the PV's node affinity already forces this).
+func BuildBackupCronJob(sv *nfszv1alpha1.SharedVolume, operatorNamespace, image string) *batchv1.CronJob {
+	labels := managedLabels(sv)
+	podLabels := make(map[string]string, len(labels)+1)
+	maps.Copy(podLabels, labels)
+	podLabels["app.kubernetes.io/component"] = "backup"
+
+	script := fmt.Sprintf(
+		"set -e\nmkdir -p /backup/%[1]s\nexec rsync -rlt --delete --stats /data/ /backup/%[1]s/",
+		sv.Name,
+	)
+	podSpec := backupPodSpec(sv, image, script, true)
+	podSpec.Affinity = &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						LabelSharedVolume:             sv.Name,
+						"app.kubernetes.io/component": "nfs-server",
+					},
+				},
+				TopologyKey: corev1.LabelHostname,
+			}},
+		},
+	}
+
+	return &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      BackupCronJobName(sv),
+			Namespace: operatorNamespace,
+			Labels:    labels,
+		},
+		Spec: batchv1.CronJobSpec{
+			Schedule:                   sv.Spec.Backup.Schedule,
+			Suspend:                    sv.Spec.Backup.Suspend,
+			ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+			StartingDeadlineSeconds:    ptr.To(int64(300)),
+			SuccessfulJobsHistoryLimit: ptr.To(int32(1)),
+			FailedJobsHistoryLimit:     ptr.To(int32(1)),
+			JobTemplate: batchv1.JobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: batchv1.JobSpec{
+					BackoffLimit:          ptr.To(int32(2)),
+					ActiveDeadlineSeconds: ptr.To(int64(3600)),
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+						Spec:       podSpec,
+					},
+				},
+			},
+		},
+	}
+}
+
+// BuildSeedJob copies an existing host backup into a fresh backing PVC before
+// the server Deployment is first created. Both guards live in the script so
+// the decision is atomic with the copy: no backup dir → no-op, data already
+// present → refuse (never clobbers a retained or re-adopted PVC). No affinity:
+// the seed is the PVC's first and only consumer.
+func BuildSeedJob(sv *nfszv1alpha1.SharedVolume, operatorNamespace, image string) *batchv1.Job {
+	labels := managedLabels(sv)
+	podLabels := make(map[string]string, len(labels)+1)
+	maps.Copy(podLabels, labels)
+	podLabels["app.kubernetes.io/component"] = "seed"
+
+	script := fmt.Sprintf(`set -e
+SRC=/backup/%s
+[ -d "$SRC" ] || { echo "no backup at $SRC; nothing to seed"; exit 0; }
+[ -z "$(ls -A /data 2>/dev/null)" ] || { echo "/data not empty; refusing to seed"; exit 0; }
+exec rsync -rlt --stats "$SRC"/ /data/`, sv.Name)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      SeedJobName(sv),
+			Namespace: operatorNamespace,
+			Labels:    labels,
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: ptr.To(int32(3)),
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				Spec:       backupPodSpec(sv, image, script, false),
+			},
 		},
 	}
 }

@@ -24,14 +24,17 @@ import (
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -50,6 +53,7 @@ func newReconciler() *SharedVolumeReconciler {
 		Recorder:          events.NewFakeRecorder(64),
 		OperatorNamespace: operatorNS,
 		GaneshaImage:      "nfsz/ganesha:test",
+		BackupImage:       "nfsz/backup:test",
 		AllowCIDRs:        []string{"10.99.0.0/16"},
 	}
 }
@@ -312,6 +316,161 @@ var _ = Describe("SharedVolume controller", func() {
 	})
 })
 
+func withBackup(sv *nfszv1alpha1.SharedVolume, policy nfszv1alpha1.RestorePolicy) *nfszv1alpha1.SharedVolume {
+	sv.Spec.Backup = &nfszv1alpha1.BackupSpec{
+		Schedule: "0 3 * * *",
+		Destination: nfszv1alpha1.BackupDestination{
+			HostPath: &nfszv1alpha1.HostPathDestination{Path: "/var/nfsz-backups"},
+		},
+		RestorePolicy: policy,
+	}
+	return sv
+}
+
+// markSeedJob fakes the job controller (absent in envtest) finishing the
+// seed job with the given condition.
+func markSeedJob(sv *nfszv1alpha1.SharedVolume, condType batchv1.JobConditionType) {
+	GinkgoHelper()
+	job := &batchv1.Job{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: SeedJobName(sv)}, job)).To(Succeed())
+	now := metav1.Now()
+	job.Status.StartTime = &now
+	if condType == batchv1.JobComplete {
+		job.Status.CompletionTime = &now
+		job.Status.Succeeded = 1
+		job.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, Reason: "CompletionsReached"},
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, Reason: "CompletionsReached"},
+		}
+	} else {
+		job.Status.Failed = 1
+		job.Status.Conditions = []batchv1.JobCondition{
+			{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+		}
+	}
+	Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+}
+
+var _ = Describe("backup and seed-from-backup", func() {
+	BeforeEach(func() {
+		ensureNamespace(operatorNS, nil)
+	})
+
+	It("manages the backup CronJob and tracks spec changes", func() {
+		ensureNamespace("bk-ns", nil)
+		sv := withBackup(newSharedVolume([]string{"bk-ns"}, nil), nfszv1alpha1.RestoreNever)
+		Expect(k8sClient.Create(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		reconcileOnce(sv.Name)
+
+		By("CronJob shape")
+		cj := &batchv1.CronJob{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: BackupCronJobName(sv)}, cj)).To(Succeed())
+		Expect(cj.Spec.Schedule).To(Equal("0 3 * * *"))
+		Expect(cj.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
+
+		By("schedule and suspend changes are pushed to the CronJob")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, sv)).To(Succeed())
+		sv.Spec.Backup.Schedule = "30 4 * * *"
+		sv.Spec.Backup.Suspend = ptr.To(true)
+		Expect(k8sClient.Update(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: BackupCronJobName(sv)}, cj)).To(Succeed())
+		Expect(cj.Spec.Schedule).To(Equal("30 4 * * *"))
+		Expect(cj.Spec.Suspend).To(HaveValue(BeTrue()))
+
+		By("removing spec.backup deletes the CronJob")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, sv)).To(Succeed())
+		sv.Spec.Backup = nil
+		Expect(k8sClient.Update(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: BackupCronJobName(sv)}, cj)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("withholds the server until the seed job completes", func() {
+		ensureNamespace("seed-ns", nil)
+		sv := withBackup(newSharedVolume([]string{"seed-ns"}, nil), nfszv1alpha1.RestoreAuto)
+		Expect(k8sClient.Create(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+
+		By("seed job exists, Deployment does not, phase is Provisioning")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: SeedJobName(sv)}, &batchv1.Job{})).To(Succeed())
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, &appsv1.Deployment{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		got := &nfszv1alpha1.SharedVolume{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(nfszv1alpha1.PhaseProvisioning))
+		cond := meta.FindStatusCondition(got.Status.Conditions, nfszv1alpha1.ConditionRestored)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(nfszv1alpha1.ReasonSeedRunning))
+
+		By("seed completion unblocks the Deployment and sets Restored=True")
+		markSeedJob(sv, batchv1.JobComplete)
+		reconcileOnce(sv.Name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, &appsv1.Deployment{})).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, got)).To(Succeed())
+		cond = meta.FindStatusCondition(got.Status.Conditions, nfszv1alpha1.ConditionRestored)
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal(nfszv1alpha1.ReasonSeeded))
+	})
+
+	It("keeps the server withheld when the seed job fails", func() {
+		ensureNamespace("seedfail-ns", nil)
+		sv := withBackup(newSharedVolume([]string{"seedfail-ns"}, nil), nfszv1alpha1.RestoreAuto)
+		Expect(k8sClient.Create(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+
+		markSeedJob(sv, batchv1.JobFailed)
+		reconcileOnce(sv.Name)
+
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, &appsv1.Deployment{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		got := &nfszv1alpha1.SharedVolume{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, got)).To(Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, nfszv1alpha1.ConditionRestored)
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(nfszv1alpha1.ReasonSeedFailed))
+
+		By("deleting the failed job retries the seed")
+		Expect(k8sClient.Delete(ctx, &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Namespace: operatorNS, Name: SeedJobName(sv)},
+		}, client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
+		Eventually(func() bool {
+			err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: SeedJobName(sv)}, &batchv1.Job{})
+			return apierrors.IsNotFound(err)
+		}).WithTimeout(timeout10s).Should(BeTrue())
+		reconcileOnce(sv.Name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: SeedJobName(sv)}, &batchv1.Job{})).To(Succeed())
+	})
+
+	It("never seeds under a pre-existing server", func() {
+		ensureNamespace("preex-ns", nil)
+		sv := newSharedVolume([]string{"preex-ns"}, nil)
+		Expect(k8sClient.Create(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+		reconcileOnce(sv.Name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: ServerName(sv)}, &appsv1.Deployment{})).To(Succeed())
+
+		By("adding backup to the live volume skips the seed")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, sv)).To(Succeed())
+		withBackup(sv, nfszv1alpha1.RestoreAuto)
+		Expect(k8sClient.Update(ctx, sv)).To(Succeed())
+		reconcileOnce(sv.Name)
+
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: SeedJobName(sv)}, &batchv1.Job{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		got := &nfszv1alpha1.SharedVolume{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, got)).To(Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, nfszv1alpha1.ConditionRestored)
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal(nfszv1alpha1.ReasonPreexistingServer))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: operatorNS, Name: BackupCronJobName(sv)}, &batchv1.CronJob{})).To(Succeed())
+	})
+})
+
 var _ = Describe("resource builders", func() {
 	It("renders the ganesha conf hash into the pod template", func() {
 		sv := &nfszv1alpha1.SharedVolume{
@@ -326,6 +485,49 @@ var _ = Describe("resource builders", func() {
 		deploy2 := BuildServerDeployment(sv, operatorNS, "img", cm)
 		Expect(deploy2.Spec.Template.Annotations["nfsz.dev/conf-hash"]).
 			NotTo(Equal(deploy.Spec.Template.Annotations["nfsz.dev/conf-hash"]))
+	})
+
+	It("shapes the backup CronJob: mirror command, mounts, co-scheduling", func() {
+		sv := withBackup(&nfszv1alpha1.SharedVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "bk"},
+			Spec:       nfszv1alpha1.SharedVolumeSpec{Capacity: resource.MustParse("1Gi")},
+		}, nfszv1alpha1.RestoreAuto)
+		cj := BuildBackupCronJob(sv, operatorNS, "img")
+
+		Expect(cj.Spec.ConcurrencyPolicy).To(Equal(batchv1.ForbidConcurrent))
+		pod := cj.Spec.JobTemplate.Spec.Template.Spec
+		Expect(pod.Containers[0].Command[2]).To(ContainSubstring("rsync -rlt --delete"))
+		Expect(pod.Containers[0].Command[2]).To(ContainSubstring("/backup/bk/"))
+
+		Expect(pod.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "backing", SubPath: "data", MountPath: "/data", ReadOnly: true,
+		}))
+		Expect(backupHostPath(pod)).To(Equal("/var/nfsz-backups"))
+
+		By("required podAffinity pins the backup pod to the server's node")
+		term := pod.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+		Expect(term.TopologyKey).To(Equal(corev1.LabelHostname))
+		Expect(term.LabelSelector.MatchLabels).To(HaveKeyWithValue(LabelSharedVolume, "bk"))
+	})
+
+	It("shapes the seed job: guarded copy, writable data, read-only backup", func() {
+		sv := withBackup(&nfszv1alpha1.SharedVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "sd"},
+			Spec:       nfszv1alpha1.SharedVolumeSpec{Capacity: resource.MustParse("1Gi")},
+		}, nfszv1alpha1.RestoreAuto)
+		job := BuildSeedJob(sv, operatorNS, "img")
+
+		pod := job.Spec.Template.Spec
+		script := pod.Containers[0].Command[2]
+		Expect(script).To(ContainSubstring("refusing to seed"), "guards a non-empty volume")
+		Expect(script).To(ContainSubstring("nothing to seed"), "tolerates a missing backup dir")
+		Expect(pod.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "backing", SubPath: "data", MountPath: "/data",
+		}))
+		Expect(pod.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+			Name: "backup", MountPath: "/backup", ReadOnly: true,
+		}))
+		Expect(pod.Affinity).To(BeNil(), "seed is the PVC's first consumer")
 	})
 
 	It("uses ClusterIP, pseudo-root path and v4.1 mount options in PVs", func() {

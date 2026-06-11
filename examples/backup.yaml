@@ -1,0 +1,31 @@
+# A SharedVolume with scheduled backups to the host machine.
+#
+# The destination path is the *node* path; `make kind-up` maps it to
+# $NFSZ_BACKUP_HOST_DIR (default ~/.nfsz/backups) on the host, so the mirror
+# at ~/.nfsz/backups/media/ is plain browsable files that survive
+# `kind delete cluster`. If a backup for "media" already exists there when
+# this SharedVolume is created, the volume is seeded from it before the NFS
+# server starts (restorePolicy: Auto is the default).
+#
+#   kubectl apply -f examples/backup.yaml
+#   kubectl get sv media                        # wait for Ready
+#   kubectl create job --from=cronjob/nfsz-media-backup backup-now -n nfsz-system   # run one immediately
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+---
+apiVersion: nfsz.dev/v1alpha1
+kind: SharedVolume
+metadata:
+  name: media
+spec:
+  capacity: 10Gi
+  reclaimPolicy: Retain
+  namespaces:
+    names: [media]
+  backup:
+    schedule: "0 */6 * * *"          # every six hours
+    destination:
+      hostPath:
+        path: /var/nfsz-backups

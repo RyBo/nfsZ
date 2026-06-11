@@ -13,6 +13,8 @@ controllerManager:
     env:
       # NFS-Ganesha server image run for each SharedVolume.
       GANESHA_IMAGE: ghcr.io/rybo/nfsz-ganesha:latest
+      # rsync image run for backup and seed-from-backup jobs.
+      BACKUP_IMAGE: ghcr.io/rybo/nfsz-backup:latest
     resources:
       limits:
         cpu: 500m

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -61,6 +63,8 @@ type SharedVolumeReconciler struct {
 	OperatorNamespace string
 	// GaneshaImage is the NFS server image to run.
 	GaneshaImage string
+	// BackupImage runs the rsync backup and seed pods.
+	BackupImage string
 	// AllowCIDRs are extra CIDRs admitted by generated NetworkPolicies, for
 	// CNIs whose cross-node traffic arrives from tunnel IPs rather than
 	// node IPs (e.g. Calico VXLAN).
@@ -79,6 +83,7 @@ type SharedVolumeReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SharedVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -124,6 +129,10 @@ func (r *SharedVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	if err := r.reconcileBackup(ctx, sv); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.updateStatus(ctx, sv, clusterIP, serverReady, bindings); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
@@ -161,29 +170,40 @@ func (r *SharedVolumeReconciler) reconcileServer(ctx context.Context, sv *nfszv1
 		}
 	}
 
-	deploy := BuildServerDeployment(sv, r.OperatorNamespace, r.GaneshaImage, cm)
-	existingDeploy := &appsv1.Deployment{}
-	switch err := r.Get(ctx, client.ObjectKeyFromObject(deploy), existingDeploy); {
-	case apierrors.IsNotFound(err):
-		if err := r.createOwned(ctx, sv, deploy); err != nil {
-			return "", false, err
-		}
-	case err != nil:
+	// Seed-from-backup gates the server's first start: the Deployment is not
+	// created until the seed job has run (or been ruled out). ConfigMap and
+	// Service are still ensured so bindings can use the ClusterIP meanwhile.
+	seeded, err := r.reconcileSeed(ctx, sv)
+	if err != nil {
 		return "", false, err
-	default:
-		// Roll the pod on image or conf change; leave everything else alone.
-		cur := existingDeploy.Spec.Template
-		want := deploy.Spec.Template
-		if cur.Spec.Containers[0].Image != want.Spec.Containers[0].Image ||
-			cur.Annotations[confHashAnnotation] != want.Annotations[confHashAnnotation] {
-			existingDeploy.Spec.Template = want
-			if err := r.Update(ctx, existingDeploy); err != nil {
+	}
+
+	serverReady := false
+	if seeded {
+		deploy := BuildServerDeployment(sv, r.OperatorNamespace, r.GaneshaImage, cm)
+		existingDeploy := &appsv1.Deployment{}
+		switch err := r.Get(ctx, client.ObjectKeyFromObject(deploy), existingDeploy); {
+		case apierrors.IsNotFound(err):
+			if err := r.createOwned(ctx, sv, deploy); err != nil {
 				return "", false, err
 			}
+		case err != nil:
+			return "", false, err
+		default:
+			// Roll the pod on image or conf change; leave everything else alone.
+			cur := existingDeploy.Spec.Template
+			want := deploy.Spec.Template
+			if cur.Spec.Containers[0].Image != want.Spec.Containers[0].Image ||
+				cur.Annotations[confHashAnnotation] != want.Annotations[confHashAnnotation] {
+				existingDeploy.Spec.Template = want
+				if err := r.Update(ctx, existingDeploy); err != nil {
+					return "", false, err
+				}
+			}
+			deploy = existingDeploy
 		}
-		deploy = existingDeploy
+		serverReady = deploy.Status.ReadyReplicas > 0
 	}
-	serverReady := deploy.Status.ReadyReplicas > 0
 
 	svc := BuildService(sv, r.OperatorNamespace)
 	existingSvc := &corev1.Service{}
@@ -201,6 +221,145 @@ func (r *SharedVolumeReconciler) reconcileServer(ctx context.Context, sv *nfszv1
 	// The ClusterIP is stamped into immutable PV specs; the Service must
 	// never be recreated while PVs exist. We only ever read it here.
 	return existingSvc.Spec.ClusterIP, serverReady, nil
+}
+
+// reconcileSeed gates the server's first start on the one-shot
+// seed-from-backup job. It returns true when the Deployment may be created:
+// immediately when seeding is not in play, otherwise once the seed job has
+// finished. The outcome is recorded in the Restored condition so a completed
+// seed never re-runs.
+func (r *SharedVolumeReconciler) reconcileSeed(ctx context.Context, sv *nfszv1alpha1.SharedVolume) (bool, error) {
+	if sv.Spec.Backup == nil || sv.Spec.Backup.RestorePolicy == nfszv1alpha1.RestoreNever {
+		return true, nil
+	}
+	if meta.IsStatusConditionTrue(sv.Status.Conditions, nfszv1alpha1.ConditionRestored) {
+		return true, nil
+	}
+
+	// Never seed under a server that already ran (backup added to a live
+	// volume, or the condition predates an operator upgrade).
+	existingDeploy := &appsv1.Deployment{}
+	switch err := r.Get(ctx, types.NamespacedName{Namespace: r.OperatorNamespace, Name: ServerName(sv)}, existingDeploy); {
+	case err == nil:
+		r.setRestoredCondition(sv, metav1.ConditionTrue, nfszv1alpha1.ReasonPreexistingServer,
+			"server already exists; seed skipped")
+		return true, nil
+	case !apierrors.IsNotFound(err):
+		return false, err
+	}
+
+	job := BuildSeedJob(sv, r.OperatorNamespace, r.BackupImage)
+	existing := &batchv1.Job{}
+	switch err := r.Get(ctx, client.ObjectKeyFromObject(job), existing); {
+	case apierrors.IsNotFound(err):
+		if err := r.createOwned(ctx, sv, job); err != nil {
+			return false, err
+		}
+		r.setRestoredCondition(sv, metav1.ConditionFalse, nfszv1alpha1.ReasonSeedRunning, "seed job started")
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+
+	switch {
+	case jobHasCondition(existing, batchv1.JobComplete):
+		r.setRestoredCondition(sv, metav1.ConditionTrue, nfszv1alpha1.ReasonSeeded,
+			"volume seeded from backup destination")
+		return true, nil
+	case jobHasCondition(existing, batchv1.JobFailed):
+		if r.setRestoredCondition(sv, metav1.ConditionFalse, nfszv1alpha1.ReasonSeedFailed,
+			"seed job failed; delete the job to retry") {
+			r.Recorder.Eventf(sv, nil, corev1.EventTypeWarning, "SeedFailed", "Reconcile",
+				"seed job %s/%s failed; the server will not start until the job is deleted and succeeds",
+				existing.Namespace, existing.Name)
+		}
+		return false, nil
+	default:
+		r.setRestoredCondition(sv, metav1.ConditionFalse, nfszv1alpha1.ReasonSeedRunning, "seed job running")
+		return false, nil
+	}
+}
+
+// reconcileBackup keeps the per-volume backup CronJob in sync with
+// spec.backup and mirrors its last success time into status.
+func (r *SharedVolumeReconciler) reconcileBackup(ctx context.Context, sv *nfszv1alpha1.SharedVolume) error {
+	existing := &batchv1.CronJob{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: r.OperatorNamespace, Name: BackupCronJobName(sv)}, existing)
+
+	if sv.Spec.Backup == nil {
+		sv.Status.LastBackupTime = nil
+		switch {
+		case err == nil:
+			if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		case !apierrors.IsNotFound(err):
+			return err
+		}
+		return nil
+	}
+
+	desired := BuildBackupCronJob(sv, r.OperatorNamespace, r.BackupImage)
+	switch {
+	case apierrors.IsNotFound(err):
+		return r.createOwned(ctx, sv, desired)
+	case err != nil:
+		return err
+	}
+
+	if backupCronJobDrifted(existing, desired) {
+		existing.Spec = desired.Spec
+		if err := r.Update(ctx, existing); err != nil {
+			return err
+		}
+	}
+	sv.Status.LastBackupTime = existing.Status.LastSuccessfulTime
+	return nil
+}
+
+// backupCronJobDrifted compares only fields the operator owns; comparing the
+// whole spec would fight API-server defaulting forever.
+func backupCronJobDrifted(existing, desired *batchv1.CronJob) bool {
+	if existing.Spec.Schedule != desired.Spec.Schedule ||
+		ptr.Deref(existing.Spec.Suspend, false) != ptr.Deref(desired.Spec.Suspend, false) {
+		return true
+	}
+	cur := existing.Spec.JobTemplate.Spec.Template.Spec
+	want := desired.Spec.JobTemplate.Spec.Template.Spec
+	if len(cur.Containers) != 1 ||
+		cur.Containers[0].Image != want.Containers[0].Image ||
+		!slices.Equal(cur.Containers[0].Command, want.Containers[0].Command) {
+		return true
+	}
+	return backupHostPath(cur) != backupHostPath(want)
+}
+
+func backupHostPath(pod corev1.PodSpec) string {
+	for _, v := range pod.Volumes {
+		if v.Name == "backup" && v.HostPath != nil {
+			return v.HostPath.Path
+		}
+	}
+	return ""
+}
+
+func (r *SharedVolumeReconciler) setRestoredCondition(sv *nfszv1alpha1.SharedVolume, status metav1.ConditionStatus, reason, message string) bool {
+	return meta.SetStatusCondition(&sv.Status.Conditions, metav1.Condition{
+		Type:               nfszv1alpha1.ConditionRestored,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: sv.Generation,
+	})
+}
+
+func jobHasCondition(job *batchv1.Job, t batchv1.JobConditionType) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == t && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // nodeIPs returns the sorted addresses of all cluster nodes. Kubelet mounts
@@ -456,14 +615,19 @@ func (r *SharedVolumeReconciler) reconcileDelete(ctx context.Context, sv *nfszv1
 		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 
-	// 2. Server stack.
+	// 2. Server stack + backup jobs. Background propagation so Job pods go
+	// too (Jobs orphan their pods under the legacy default). Backup data at
+	// the destination is deliberately never touched — surviving deletion is
+	// the feature's contract.
 	for _, obj := range []client.Object{
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: ServerName(sv), Namespace: r.OperatorNamespace}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ConfigMapName(sv), Namespace: r.OperatorNamespace}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: BackupCronJobName(sv), Namespace: r.OperatorNamespace}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: SeedJobName(sv), Namespace: r.OperatorNamespace}},
 	} {
-		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
 	}
@@ -629,6 +793,8 @@ func (r *SharedVolumeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.PersistentVolume{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Owns(&batchv1.CronJob{}).
+		Owns(&batchv1.Job{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(mapNamespace)).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(mapNode)).
 		Named("sharedvolume").
