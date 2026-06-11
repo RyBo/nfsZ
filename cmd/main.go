@@ -62,7 +62,7 @@ func envOr(key, fallback string) string {
 
 func splitNonEmpty(csv string) []string {
 	var out []string
-	for _, s := range strings.Split(csv, ",") {
+	for s := range strings.SplitSeq(csv, ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
@@ -212,7 +212,7 @@ func main() {
 	if err := (&controller.SharedVolumeReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
-		Recorder:          mgr.GetEventRecorderFor("nfsz"),
+		Recorder:          mgr.GetEventRecorder("nfsz"),
 		OperatorNamespace: operatorNamespace,
 		GaneshaImage:      ganeshaImage,
 		AllowCIDRs:        splitNonEmpty(allowCIDRs),

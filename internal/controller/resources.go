@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -118,10 +119,8 @@ func confHash(cm *corev1.ConfigMap) string {
 func BuildServerDeployment(sv *nfszv1alpha1.SharedVolume, operatorNamespace, image string, cm *corev1.ConfigMap) *appsv1.Deployment {
 	labels := managedLabels(sv)
 	selector := map[string]string{LabelSharedVolume: sv.Name, "app.kubernetes.io/component": "nfs-server"}
-	podLabels := map[string]string{}
-	for k, v := range labels {
-		podLabels[k] = v
-	}
+	podLabels := make(map[string]string, len(labels)+1)
+	maps.Copy(podLabels, labels)
 	podLabels["app.kubernetes.io/component"] = "nfs-server"
 
 	backingVolume := corev1.Volume{
@@ -292,7 +291,7 @@ func BuildNetworkPolicy(sv *nfszv1alpha1.SharedVolume, operatorNamespace string,
 	nfsTCP := intstr.FromInt32(nfsPort)
 	tcp := corev1.ProtocolTCP
 
-	var peers []networkingv1.NetworkPolicyPeer
+	peers := make([]networkingv1.NetworkPolicyPeer, 0, len(targets)+len(nodeIPs)+len(extraCIDRs))
 	for _, ns := range targets {
 		peers = append(peers, networkingv1.NetworkPolicyPeer{
 			NamespaceSelector: &metav1.LabelSelector{

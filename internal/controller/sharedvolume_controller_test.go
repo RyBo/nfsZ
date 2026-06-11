@@ -31,7 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -47,7 +47,7 @@ func newReconciler() *SharedVolumeReconciler {
 	return &SharedVolumeReconciler{
 		Client:            k8sClient,
 		Scheme:            scheme.Scheme,
-		Recorder:          record.NewFakeRecorder(64),
+		Recorder:          events.NewFakeRecorder(64),
 		OperatorNamespace: operatorNS,
 		GaneshaImage:      "nfsz/ganesha:test",
 		AllowCIDRs:        []string{"10.99.0.0/16"},

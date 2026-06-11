@@ -33,7 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -55,7 +55,7 @@ const (
 type SharedVolumeReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 
 	// OperatorNamespace hosts the per-volume NFS server stacks.
 	OperatorNamespace string
@@ -328,7 +328,6 @@ func (r *SharedVolumeReconciler) reconcileBinding(ctx context.Context, sv *nfszv
 		if err := r.createOwned(ctx, sv, pv); err != nil {
 			return "", err
 		}
-		existingPV = pv
 	case err != nil:
 		return "", err
 	default:
@@ -358,7 +357,7 @@ func (r *SharedVolumeReconciler) reconcileBinding(ctx context.Context, sv *nfszv
 
 	// Never adopt a PVC we didn't create.
 	if existingPVC.Labels[LabelSharedVolume] != sv.Name {
-		r.Recorder.Eventf(sv, corev1.EventTypeWarning, "PVCConflict",
+		r.Recorder.Eventf(sv, nil, corev1.EventTypeWarning, "PVCConflict", "Reconcile",
 			"namespace %s already has a PVC named %s not managed by this SharedVolume", ns, pvc.Name)
 		return nfszv1alpha1.BindingConflict, nil
 	}
