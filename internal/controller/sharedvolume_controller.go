@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"slices"
 	"sort"
 	"time"
@@ -364,7 +365,18 @@ func jobHasCondition(job *batchv1.Job, t batchv1.JobConditionType) bool {
 
 // nodeIPs returns the sorted addresses of all cluster nodes. Kubelet mounts
 // NFS from the node network namespace, so generated NetworkPolicies must
-// admit these.
+// admit every address a node's traffic can carry:
+//
+//   - InternalIP/ExternalIP — the source for unmasqueraded node traffic.
+//   - The first two addresses of each node's podCIDR. Masquerading CNIs
+//     rewrite node→remote-pod traffic to the node's tunnel address, which
+//     flannel (k3s default) takes from the podCIDR base (.0); the .1
+//     bridge/gateway address is the same-node source under bridge/ptp CNIs.
+//     Both are node-owned — CNIs never allocate them to pods — so admitting
+//     them keeps the trust boundary at "nodes", same as InternalIPs.
+//
+// CNIs whose tunnel IPs are IPAM-allocated rather than podCIDR-derived
+// (e.g. Calico VXLAN) still need --allow-cidrs.
 func (r *SharedVolumeReconciler) nodeIPs(ctx context.Context) ([]string, error) {
 	nodeList := &corev1.NodeList{}
 	if err := r.List(ctx, nodeList); err != nil {
@@ -372,9 +384,21 @@ func (r *SharedVolumeReconciler) nodeIPs(ctx context.Context) ([]string, error) 
 	}
 	set := map[string]bool{}
 	for i := range nodeList.Items {
-		for _, addr := range nodeList.Items[i].Status.Addresses {
+		node := &nodeList.Items[i]
+		for _, addr := range node.Status.Addresses {
 			if addr.Type == corev1.NodeInternalIP || addr.Type == corev1.NodeExternalIP {
 				set[addr.Address] = true
+			}
+		}
+		for _, cidr := range podCIDRsOf(node) {
+			p, err := netip.ParsePrefix(cidr)
+			if err != nil {
+				continue
+			}
+			base := p.Addr()
+			set[base.String()] = true
+			if next := base.Next(); p.Contains(next) {
+				set[next.String()] = true
 			}
 		}
 	}
@@ -384,6 +408,18 @@ func (r *SharedVolumeReconciler) nodeIPs(ctx context.Context) ([]string, error) 
 	}
 	sort.Strings(ips)
 	return ips, nil
+}
+
+// podCIDRsOf returns the node's pod CIDR list, falling back to the singular
+// field for clusters that don't populate the dual-stack list.
+func podCIDRsOf(node *corev1.Node) []string {
+	if len(node.Spec.PodCIDRs) > 0 {
+		return node.Spec.PodCIDRs
+	}
+	if node.Spec.PodCIDR != "" {
+		return []string{node.Spec.PodCIDR}
+	}
+	return nil
 }
 
 // reconcileNetworkPolicy keeps the per-volume ingress policy in sync with

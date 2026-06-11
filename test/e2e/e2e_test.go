@@ -125,6 +125,10 @@ spec:
 		ipBlocks := mustKubectl("get", "networkpolicy", "-n", operatorNamespace, "nfsz-"+sv+"-server",
 			"-o", "jsonpath={.spec.ingress[0].from[*].ipBlock.cidr}")
 		Expect(strings.TrimSpace(ipBlocks)).NotTo(BeEmpty(), "node IPs should be admitted for kubelet mounts")
+		// kind's default cluster CIDR is 10.244.0.0/16; each node contributes
+		// its podCIDR base + gateway as /32s (masquerading-CNI node identity).
+		Expect(ipBlocks).To(MatchRegexp(`10\.244\.\d+\.0/32`),
+			"podCIDR-derived node identities should be admitted")
 	})
 
 	It("shares live writes across namespaces", func() {

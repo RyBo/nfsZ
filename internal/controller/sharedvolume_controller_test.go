@@ -234,6 +234,10 @@ var _ = Describe("SharedVolume controller", func() {
 			Expect(apierrors.IsAlreadyExists(err)).To(BeTrue())
 		}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "np-node"}, node)).To(Succeed())
+		// podCIDR set after creation, as the cloud/kube controller does.
+		node.Spec.PodCIDR = "10.42.9.0/24"
+		node.Spec.PodCIDRs = []string{"10.42.9.0/24", "fd00:42::/64"}
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
 		node.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "172.18.0.9"}}
 		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
 
@@ -261,6 +265,12 @@ var _ = Describe("SharedVolume controller", func() {
 		Expect(nsPeers).To(ContainElement("np-ns"))
 		Expect(ipPeers).To(ContainElement("172.18.0.9/32"))
 		Expect(ipPeers).To(ContainElement("10.99.0.0/16"), "operator AllowCIDRs included")
+
+		By("podCIDR-derived node identities admitted (masquerading CNIs, e.g. k3s flannel)")
+		Expect(ipPeers).To(ContainElement("10.42.9.0/32"), "flannel tunnel address (podCIDR base)")
+		Expect(ipPeers).To(ContainElement("10.42.9.1/32"), "CNI bridge/gateway address")
+		Expect(ipPeers).To(ContainElement("fd00:42::/128"), "IPv6 podCIDR base")
+		Expect(ipPeers).To(ContainElement("fd00:42::1/128"), "IPv6 gateway")
 
 		By("disabling removes the policy")
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sv.Name}, sv)).To(Succeed())
